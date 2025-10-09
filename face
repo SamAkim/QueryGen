@@ -1,0 +1,14 @@
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QueryGen AI | Intelligent SQL Generation</title>
+    
+</head>
+<body>
+    <div id="loader" class="hidden">
+        <div class="loader-content">
+            <div class="loader-spinner"></div>
+            <p>Processing Request</p>
+        </div>
+    </div>
