@@ -1602,6 +1602,30 @@ def query_history(project_id: str, current_user: dict = Depends(get_current_user
 # ----------------------------
 # Run with uvicorn
 # ----------------------------
+# Add this new endpoint to app_backend.py
+
+@app.get("/analytics-data")
+def get_analytics_data(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Access forbidden: Admins only.")
+
+    try:
+        queries, feedback, projects, documents, users = load_data()
+
+        # --- THIS IS THE FIX ---
+        # Replace any NaN values in the queries DataFrame with None (which becomes 'null' in JSON)
+        queries = queries.replace({np.nan: None})
+        
+        return {
+            "queries": queries.to_dict(orient="records"),
+            "feedback": feedback.to_dict(orient="records"),
+            "projects": projects.to_dict(orient="records"),
+            "documents": documents.to_dict(orient="records"),
+            "users": users[["id", "username", "role"]].to_dict(orient="records"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load analytics data: {str(e)}")
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app_backend:app", host="127.0.0.1", port=8000, reload=True)
