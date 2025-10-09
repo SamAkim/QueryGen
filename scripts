@@ -1,0 +1,710 @@
+document.addEventListener('DOMContentLoaded', () => {
+    // --- CONFIGURATION & STATE ---
+    const API_BASE_URL = 'http://127.0.0.1:8000';
+    let state = {
+        token: localStorage.getItem('accessToken'),
+        user: null,
+        currentPage: 'query',
+        projects: [],
+        selectedProjectId: null,
+        selectedProjectName: null,
+        chatHistory: {},
+        conversationId: {},
+        charts: {},
+    };
+
+    const $ = (selector) => document.querySelector(selector);
+    const $$ = (selector) => document.querySelectorAll(selector);
+
+    function init() {
+        setupEventListeners();
+        verifyTokenAndInit();
+    }
+
+    // --- CORE ---
+    async function apiRequest(endpoint, options = {}) {
+        showLoader(true);
+        const headers = { ...options.headers };
+        if (!(options.body instanceof FormData)) {
+            headers['Content-Type'] = 'application/json';
+        }
+        if (state.token) {
+            headers['Authorization'] = `Bearer ${state.token}`;
+        }
+        try {
+            const response = await fetch(`${API_BASE_URL}${endpoint}`, { ...options, headers });
+            if (response.status === 401) {
+                handleLogout();
+                throw new Error("Session expired. Please log in.");
+            }
+            if (options.stream) return response;
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.detail || `Server Error: ${response.status}`);
+            }
+            return response.status === 204 ? null : response.json();
+        } catch (error) {
+            showError(error.message, '#main-error');
+            throw error;
+        } finally {
+            showLoader(false);
+        }
+    }
+
+    function navigateTo(page) {
+        $$('.page-content').forEach(p => p.classList.remove('active'));
+        const newPage = $(`#${page}-page`);
+        if (newPage) {
+            newPage.classList.add('active');
+        } else {
+            console.error(`Navigation failed: Page element with ID #${page}-page not found.`);
+            return;
+        }
+
+        $$('.nav-btn').forEach(b => b.classList.remove('active'));
+        const activeBtn = $(`button[data-page="${page}"]`);
+        if (activeBtn) {
+            activeBtn.classList.add('active');
+        }
+
+        state.currentPage = page;
+
+        switch (page) {
+            case 'projects': loadProjects(); break;
+            case 'query': loadProjectsForQueryPage(); break;
+            case 'query_history': loadProjectsForHistoryPage(); break;
+            case 'analytics': loadAnalyticsData(); break;
+        }
+    }
+
+    const showLoader = (isLoading) => {
+        $('#loader').classList.toggle('hidden', !isLoading);
+    }
+    
+    const showError = (message, container = '#auth-error') => {
+        const el = $(container);
+        if(!el) return;
+        el.textContent = message;
+        el.classList.remove('hidden');
+        setTimeout(() => el.classList.add('hidden'), 5000);
+    }
+
+    async function verifyTokenAndInit() {
+        if (state.token) {
+            try {
+                state.user = await apiRequest('/verify_access_token');
+                $('#username-display').textContent = state.user.username;
+                $('#auth-container').classList.add('hidden');
+                $('#app-wrapper').classList.remove('hidden');
+                
+                if (state.user.role === 'admin') {
+                    $$('.admin-only').forEach(el => el.style.display = 'flex'); // Use flex to match nav-btn
+                }
+                navigateTo(state.currentPage);
+            } catch (error) {
+                handleLogout();
+            }
+        }
+    }
+
+    function handleLogout() {
+        state.token = null;
+        state.user = null;
+        localStorage.removeItem('accessToken');
+        location.reload();
+    }
+
+    // --- EVENT LISTENERS ---
+    function setupEventListeners() {
+        // Auth
+        $('#login-form').addEventListener('submit', handleLogin);
+        $('#register-form').addEventListener('submit', handleRegister);
+        $('#show-login-tab').addEventListener('click', () => switchAuthTab('login'));
+        $('#show-register-tab').addEventListener('click', () => switchAuthTab('register'));
+        $('#logout-btn').addEventListener('click', handleLogout);
+
+        // Navigation
+        $('#sidebar-nav').addEventListener('click', (e) => {
+            const button = e.target.closest('.nav-btn');
+            if (button && button.dataset.page) navigateTo(button.dataset.page);
+        });
+        $('#back-to-projects-btn').addEventListener('click', () => navigateTo('projects'));
+        
+        // Projects
+        $('#create-project-form').addEventListener('submit', handleCreateProject);
+        $('#projects-grid').addEventListener('click', e => {
+            const button = e.target.closest('.manage-project-btn');
+            if(button) {
+                 state.selectedProjectId = button.dataset.id;
+                 state.selectedProjectName = button.dataset.name;
+                 navigateTo('project-detail');
+                 loadProjectDetails();
+            }
+        });
+
+        // Project Detail & Upload
+        $$('#project-detail-page .tabs .tab-btn').forEach(btn => btn.addEventListener('click', handleTabSwitch));
+        $$('#analytics-page .tabs .tab-btn').forEach(btn => btn.addEventListener('click', handleTabSwitch));
+        setupUploadArea();
+        $('#upload-form').addEventListener('submit', handleUploadFiles);
+        $('#document-list').addEventListener('click', e => {
+            if(e.target.closest('.delete-btn')) handleDeleteDocument(e.target.closest('.delete-btn').dataset.id);
+        });
+
+        // Chat
+        $('#chat-form').addEventListener('submit', handleChatSubmit);
+        $('#clear-chat-btn').addEventListener('click', handleClearChat);
+        $('#query-project-selector').addEventListener('change', (e) => {
+            const selectedOption = e.target.options[e.target.selectedIndex];
+            state.selectedProjectId = selectedOption.value;
+            state.selectedProjectName = selectedOption.text;
+            renderChatHistory();
+        });
+
+        // History
+        $('#history-project-selector').addEventListener('change', loadConversationsForHistory);
+        $('#history-conversation-selector').addEventListener('change', renderConversationTranscript);
+
+        // --- NEW FUNCTIONALITY: New Chat Button ---
+        $('#new-chat-btn').addEventListener('click', () => {
+            if (!state.selectedProjectId) {
+                showError("Please select a project first to start a new chat.", '#main-error');
+                return;
+            }
+            // Clear chat and conversation ID for the current project
+            state.chatHistory[state.selectedProjectId] = [];
+            state.conversationId[state.selectedProjectId] = null;
+            
+            // Navigate to chat page if not already there and render the empty state
+            navigateTo('query');
+            renderChatHistory();
+        });
+    }
+    
+    // --- AUTHENTICATION ---
+    async function handleLogin(e) {
+        e.preventDefault();
+        const username = $('#login-username').value;
+        const password = $('#login-password').value;
+        try {
+            const data = await apiRequest('/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+            localStorage.setItem('accessToken', data.access_token);
+            state.token = data.access_token;
+            verifyTokenAndInit();
+        } catch (error) { /* Handled in apiRequest */ }
+    }
+    
+    async function handleRegister(e) {
+        e.preventDefault();
+        const username = $('#register-username').value;
+        const password = $('#register-password').value;
+        if (password !== $('#register-confirm-password').value) return showError("Passwords do not match.");
+        try {
+            await apiRequest('/register', { method: 'POST', body: JSON.stringify({ username, password }) });
+            alert("Registration successful! Please log in.");
+            switchAuthTab('login');
+            $('#login-form').reset();
+            $('#register-form').reset();
+        } catch (error) { /* Handled in apiRequest */ }
+    }
+    
+    function switchAuthTab(tabName) {
+        $('#login-form').classList.toggle('hidden', tabName !== 'login');
+        $('#register-form').classList.toggle('hidden', tabName !== 'register');
+        $('#show-login-tab').classList.toggle('active', tabName === 'login');
+        $('#show-register-tab').classList.toggle('active', tabName === 'register');
+        $('#auth-error').classList.add('hidden'); // Clear previous errors
+    }
+    
+    // --- PROJECTS & DOCUMENTS ---
+    async function loadProjects() {
+        try {
+            state.projects = await apiRequest('/projects');
+            const grid = $('#projects-grid');
+            grid.innerHTML = '';
+            if (!state.projects || state.projects.length === 0) {
+                grid.innerHTML = '<p>No projects found. Create one to get started!</p>';
+                return;
+            }
+            state.projects.forEach(p => {
+                grid.innerHTML += `
+                    <div class="project-card">
+                        <div class="project-card-header">
+                            <h4><i class="fas fa-folder"></i> ${p.project_name}</h4>
+                        </div>
+                        <div class="project-card-body">
+                            <p>Created: ${new Date(p.created_at).toLocaleDateString()}</p>
+                        </div>
+                        <div class="project-card-footer">
+                            <button class="btn btn-primary btn-full manage-project-btn" data-id="${p.project_id}" data-name="${p.project_name}">
+                                Manage Project <i class="fas fa-arrow-right"></i>
+                            </button>
+                        </div>
+                    </div>`;
+            });
+        } catch (error) { console.error("Failed to load projects", error); }
+    }
+    
+    async function handleCreateProject(e) {
+        e.preventDefault();
+        const name = $('#new-project-name').value.trim();
+        if (!name) return;
+        try {
+            await apiRequest('/project', { method: 'POST', body: JSON.stringify({ project_name: name }) });
+            $('#new-project-name').value = '';
+            loadProjects();
+        } catch (error) { /* Handled */ }
+    }
+
+    async function loadProjectDetails() {
+        $('#project-detail-title').textContent = `Project: ${state.selectedProjectName}`;
+        try {
+            const data = await apiRequest(`/project/${state.selectedProjectId}/documents`);
+            const list = $('#document-list');
+            list.innerHTML = '';
+            if (data.documents.length === 0) {
+                list.innerHTML = '<p>No documents found. Upload one to begin!</p>';
+                return;
+            }
+            data.documents.forEach(doc => {
+                list.innerHTML += `
+                    <div class="document-list-item">
+                        <div class="doc-info">
+                            <i class="fas fa-file-alt"></i>
+                            <span class="doc-name">${doc.doc_name}</span>
+                        </div>
+                        <div class="doc-status">
+                            <span>${doc.status.charAt(0).toUpperCase() + doc.status.slice(1)}</span>
+                            <progress value="${doc.progress}" max="100"></progress>
+                            <button class="btn btn-sm btn-danger delete-btn" data-id="${doc.doc_id}"><i class="fas fa-trash"></i></button>
+                        </div>
+                    </div>`;
+            });
+        } catch(error) { /* Handled */ }
+    }
+
+    async function handleDeleteDocument(docId) {
+        if (!confirm("Are you sure you want to delete this document?")) return;
+        try {
+            await apiRequest(`/project/${state.selectedProjectId}/documents/${docId}`, { method: 'DELETE' });
+            loadProjectDetails();
+        } catch(error) { /* Handled */ }
+    }
+    
+    // --- FILE UPLOAD ---
+    function setupUploadArea() {
+        const uploadArea = $('#upload-area');
+        const fileInput = $('#file-upload');
+        const fileListPreview = $('#file-list-preview');
+
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, e => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        });
+        
+        ['dragenter', 'dragover'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'));
+        });
+        
+        ['dragleave', 'drop'].forEach(eventName => {
+            uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'));
+        });
+
+        uploadArea.addEventListener('drop', e => {
+            fileInput.files = e.dataTransfer.files;
+            updateFilePreview();
+        });
+
+        fileInput.addEventListener('change', updateFilePreview);
+
+        function updateFilePreview() {
+            fileListPreview.innerHTML = '';
+            if (fileInput.files.length === 0) return;
+            
+            Array.from(fileInput.files).forEach(file => {
+                fileListPreview.innerHTML += `
+                    <div class="file-list-preview-item">
+                        <span><i class="fas fa-file"></i> ${file.name}</span>
+                        <span>(${(file.size / 1024).toFixed(1)} KB)</span>
+                    </div>`;
+            });
+        }
+    }
+
+    async function handleUploadFiles(e) {
+        e.preventDefault();
+        const files = $('#file-upload').files;
+        if (files.length === 0) return showError('Please select files to upload.', '#main-error');
+        
+        const formData = new FormData();
+        for (const file of files) {
+            formData.append('files', file);
+        }
+        
+        try {
+            await apiRequest(`/upload?project_id=${state.selectedProjectId}`, { method: 'POST', body: formData });
+            $('#upload-form').reset();
+            $('#file-list-preview').innerHTML = '';
+            loadProjectDetails();
+            // Switch to manage tab to see new files
+            document.querySelector('[data-tab="manage"]').click();
+        } catch(error) { /* Handled */ }
+    }
+
+    // --- CHAT ---
+    async function loadProjectsForQueryPage() {
+        try {
+            if (!state.projects || state.projects.length === 0) {
+                 state.projects = await apiRequest('/projects');
+            }
+            const selector = $('#query-project-selector');
+            selector.innerHTML = '<option value="">-- Select a Project --</option>';
+            if (!state.projects || state.projects.length === 0) return;
+            
+            state.projects.forEach(p => {
+                selector.innerHTML += `<option value="${p.project_id}">${p.project_name}</option>`;
+            });
+
+            if (state.selectedProjectId) {
+                selector.value = state.selectedProjectId;
+            } else if (state.projects.length > 0) {
+                selector.value = state.projects[0].project_id;
+                state.selectedProjectId = selector.value;
+                state.selectedProjectName = selector.options[selector.selectedIndex].text;
+            }
+            renderChatHistory();
+
+        } catch (error) { /* Handled */ }
+    }
+
+    function renderChatHistory() {
+        const messagesContainer = $('#chat-messages');
+        messagesContainer.innerHTML = '';
+        const history = state.chatHistory[state.selectedProjectId] || [];
+
+        if(history.length === 0) {
+            messagesContainer.innerHTML = `
+                <div class="welcome-message">
+                    <div class="welcome-icon"><i class="fas fa-robot"></i></div>
+                    <h3>Ready to Assist!</h3>
+                    <p>Ask a question about the documents in '${state.selectedProjectName || 'your project'}'.</p>
+                </div>`;
+            return;
+        }
+
+        history.forEach(msg => {
+            const bubble = document.createElement('div');
+            bubble.className = `chat-bubble ${msg.role}-bubble`;
+            bubble.innerHTML = marked.parse(msg.content);
+            messagesContainer.appendChild(bubble);
+            if (msg.role === 'assistant') addFeedbackSection(bubble, msg);
+        });
+        $('#chat-container').scrollTop = $('#chat-container').scrollHeight;
+        enhanceCodeBlocks(); // Add copy buttons to new bubbles
+    }
+
+    async function handleChatSubmit(e) {
+        e.preventDefault();
+        const input = $('#chat-input');
+        const query = input.value.trim();
+        if (!query || !state.selectedProjectId) {
+            return showError('Please select a project and enter a query.', '#main-error');
+        }
+        const projId = state.selectedProjectId;
+        if (!state.chatHistory[projId]) state.chatHistory[projId] = [];
+        state.chatHistory[projId].push({ role: 'user', content: query });
+        renderChatHistory();
+        input.value = '';
+        
+        const assistantBubble = document.createElement('div');
+        assistantBubble.className = 'chat-bubble assistant-bubble';
+        assistantBubble.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+        $('#chat-messages').appendChild(assistantBubble);
+        $('#chat-container').scrollTop = $('#chat-container').scrollHeight;
+        
+        try {
+            const response = await apiRequest('/chat', {
+                method: 'POST', stream: true,
+                body: JSON.stringify({
+                    project_id: parseInt(projId),
+                    query: query,
+                    conversation_id: state.conversationId[projId] || null,
+                }),
+            });
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let fullResponse = "";
+            let metaData = {};
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                let chunk = decoder.decode(value, { stream: true });
+                if (chunk.includes("[[[META]]]")) {
+                    const parts = chunk.split("[[[META]]]");
+                    chunk = parts[0];
+                    metaData = JSON.parse(parts[1]);
+                }
+                fullResponse += chunk;
+                assistantBubble.innerHTML = marked.parse(fullResponse + " ▌");
+                $('#chat-container').scrollTop = $('#chat-container').scrollHeight;
+            }
+            assistantBubble.innerHTML = marked.parse(fullResponse);
+            const assistantMessage = {
+                role: 'assistant', content: fullResponse, user_query: query,
+                query_id: metaData.query_id, contexts: metaData.contexts
+            };
+            state.chatHistory[projId].push(assistantMessage);
+            if (!state.conversationId[projId] && metaData.query_id) {
+                state.conversationId[projId] = metaData.query_id;
+            }
+            addFeedbackSection(assistantBubble, assistantMessage);
+            enhanceCodeBlocks(); // Add copy button to the final message
+        } catch (error) {
+            assistantBubble.innerHTML = `Error: ${error.message}`;
+            assistantBubble.style.color = 'red';
+        }
+    }
+
+    function handleClearChat() {
+        if (!state.selectedProjectId) return;
+        if(confirm(`Are you sure you want to clear the visible chat history for project '${state.selectedProjectName}'? This won't delete it from your history.`)) {
+            state.chatHistory[state.selectedProjectId] = [];
+            state.conversationId[state.selectedProjectId] = null;
+            renderChatHistory();
+        }
+    }
+
+    function addFeedbackSection(bubble, message) {
+        const feedbackDiv = document.createElement('div');
+        feedbackDiv.className = 'feedback-section';
+        feedbackDiv.innerHTML = `<button class="feedback-btn" data-type="up">👍</button><button class="feedback-btn" data-type="down">👎</button>`;
+        bubble.appendChild(feedbackDiv);
+        feedbackDiv.addEventListener('click', (e) => {
+            if (e.target.matches('.feedback-btn')) {
+                submitFeedback(message, e.target.dataset.type);
+                feedbackDiv.innerHTML = '<span>Thanks for your feedback!</span>';
+            }
+        });
+    }
+
+    async function submitFeedback(msg, feedbackType) {
+        try {
+            const payload = {
+                query_id: msg.query_id || "", project_id: parseInt(state.selectedProjectId),
+                query: msg.user_query, answer: msg.content, contexts: msg.contexts,
+                feedback: feedbackType, user_id: state.user.user_id
+            };
+            await apiRequest('/feedback', { method: 'POST', body: JSON.stringify(payload) });
+        } catch(error) { /* Handled */ }
+    }
+
+    // --- NEW FUNCTIONALITY: Copy Code Button Logic ---
+    function enhanceCodeBlocks() {
+        document.querySelectorAll('.assistant-bubble pre').forEach(pre => {
+            if (pre.querySelector('.copy-btn')) return; // Avoid adding multiple buttons
+
+            const button = document.createElement('button');
+            button.className = 'copy-btn';
+            button.innerHTML = '<i class="fas fa-copy"></i> Copy';
+            
+            button.addEventListener('click', () => {
+                const code = pre.querySelector('code')?.innerText || pre.innerText;
+                navigator.clipboard.writeText(code).then(() => {
+                    button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+                    setTimeout(() => (button.innerHTML = '<i class="fas fa-copy"></i> Copy'), 2000);
+                });
+            });
+            pre.appendChild(button);
+        });
+    }
+
+    // --- HISTORY & ANALYTICS ---
+    async function loadProjectsForHistoryPage() {
+        try {
+            state.projects = await apiRequest('/projects');
+            const selector = $('#history-project-selector');
+            selector.innerHTML = '<option value="">-- Select Project --</option>';
+            state.projects.forEach(p => {
+                selector.innerHTML += `<option value="${p.project_id}">${p.project_name}</option>`;
+            });
+        } catch(error) { /* Handled */ }
+    }
+    
+    async function loadConversationsForHistory() {
+        const projectId = $('#history-project-selector').value;
+        const convSelector = $('#history-conversation-selector');
+        convSelector.innerHTML = '<option value="">-- Select Conversation --</option>';
+        $('#history-transcript').innerHTML = ''; // Clear transcript
+        if (!projectId) return;
+
+        try {
+            const history = await apiRequest(`/queryhistory/${projectId}`);
+            const conversations = history.reduce((acc, q) => {
+                acc[q.conversation_id] = acc[q.conversation_id] || [];
+                acc[q.conversation_id].push(q);
+                return acc;
+            }, {});
+            convSelector.dataset.conversations = JSON.stringify(conversations);
+            for (const convId in conversations) {
+                const firstQuery = conversations[convId][0].query;
+                convSelector.innerHTML += `<option value="${convId}">"${firstQuery.substring(0, 50)}..."</option>`;
+            }
+        } catch(error) { /* Handled */ }
+    }
+    
+// Replace the old function with this new one
+ function renderConversationTranscript() {
+        const convId = $('#history-conversation-selector').value;
+        const transcriptDiv = $('#history-transcript');
+        if (!convId) { transcriptDiv.innerHTML = ''; return; }
+        const conversations = JSON.parse($('#history-conversation-selector').dataset.conversations);
+        const messages = conversations[convId];
+        transcriptDiv.innerHTML = '<h3>Conversation Transcript</h3>';
+        messages.forEach(msg => {
+            transcriptDiv.innerHTML += `<div class="chat-bubble user-bubble">${msg.query}</div><div class="chat-bubble assistant-bubble">${marked.parse(msg.answer)}</div>`;
+        });
+    
+
+    // Add the 'Continue Conversation' button at the end
+    const continueBtn = document.createElement('button');
+    continueBtn.innerHTML = '<i class="fas fa-comments"></i> Continue This Conversation';
+    continueBtn.className = 'btn btn-primary'; // Use existing button styles
+    continueBtn.style.marginTop = '1rem';
+
+    continueBtn.addEventListener('click', () => {
+        const projectId = $('#history-project-selector').value;
+        state.selectedProjectId = projectId;
+        state.conversationId[projectId] = convId;
+
+        // Reconstruct the chat history from the conversation transcript
+        let reconstructedHistory = [];
+        messages.forEach(msg => {
+            reconstructedHistory.push({ role: 'user', content: msg.query });
+            reconstructedHistory.push({ role: 'assistant', content: msg.answer, query_id: msg.query_id });
+        });
+        state.chatHistory[projectId] = reconstructedHistory;
+
+        navigateTo('query');
+    });
+
+    transcriptDiv.appendChild(continueBtn);
+    enhanceCodeBlocks(); // Add copy buttons to the history view
+}
+
+    async function loadAnalyticsData() {
+        try {
+            const data = await apiRequest('/analytics-data');
+            renderKPIs(data);
+            renderQueryTrendChart(data.queries);
+            renderPerfKPIs(data.queries);
+            renderFeedbackChart(data.feedback);
+        } catch(error) { /* Handled */ }
+    }
+    
+    function renderKPIs(data) {
+        const kpiContainer = $('#kpi-container');
+        kpiContainer.innerHTML = `
+            <div class="card kpi-card">
+                <div class="kpi-icon"><i class="fas fa-project-diagram"></i></div>
+                <div class="kpi-content"><div class="kpi-value">${data.projects.length}</div><div class="kpi-label">Total Projects</div></div>
+            </div>
+            <div class="card kpi-card">
+                <div class="kpi-icon"><i class="fas fa-database"></i></div>
+                <div class="kpi-content"><div class="kpi-value">${data.queries.length}</div><div class="kpi-label">Total Queries</div></div>
+            </div>
+            <div class="card kpi-card">
+                <div class="kpi-icon"><i class="fas fa-users"></i></div>
+                <div class="kpi-content"><div class="kpi-value">${data.users.length}</div><div class="kpi-label">Unique Users</div></div>
+            </div>
+            <div class="card kpi-card">
+                <div class="kpi-icon"><i class="fas fa-thumbs-up"></i></div>
+                <div class="kpi-content"><div class="kpi-value">${data.feedback.length}</div><div class="kpi-label">Feedback Entries</div></div>
+            </div>`;
+    }
+
+    function renderQueryTrendChart(queries) {
+        if (state.charts.queryTrend) state.charts.queryTrend.destroy();
+        const ctx = $('#query-trend-chart').getContext('2d');
+        const dailyCounts = queries.reduce((acc, q) => {
+            const date = new Date(q.created_at).toISOString().split('T')[0];
+            acc[date] = (acc[date] || 0) + 1;
+            return acc;
+        }, {});
+        state.charts.queryTrend = new Chart(ctx, {
+            type: 'line',
+            data: { labels: Object.keys(dailyCounts).sort(), datasets: [{ label: 'Daily Query Volume', data: Object.values(dailyCounts), borderColor: 'var(--primary-500)', backgroundColor: 'rgba(99, 102, 241, 0.1)', fill: true, tension: 0.3 }] },
+            options: { responsive: true, maintainAspectRatio: false }
+        });
+    }
+    
+    function renderPerfKPIs(queries) {
+        const responseTimes = queries.map(q => q.response_time).filter(Boolean);
+        const avgRespTime = responseTimes.length ? responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length : 0;
+        const fallbackCount = queries.filter(q => q.is_fallback).length;
+        const fallbackRate = queries.length ? (fallbackCount / queries.length) * 100 : 0;
+        $('#perf-kpi-container').innerHTML = `
+            <div class="card kpi-card">
+                <div class="kpi-icon"><i class="fas fa-clock"></i></div>
+                <div class="kpi-content"><div class="kpi-value">${avgRespTime.toFixed(2)}s</div><div class="kpi-label">Avg. Response</div></div>
+            </div>
+            <div class="card kpi-card">
+                <div class="kpi-icon"><i class="fas fa-sync-alt"></i></div>
+                <div class="kpi-content"><div class="kpi-value">${fallbackRate.toFixed(1)}%</div><div class="kpi-label">LLM Fallback Rate</div></div>
+            </div>`;
+    }
+
+    function renderFeedbackChart(feedback) {
+    if (state.charts.feedback) state.charts.feedback.destroy();
+    const ctx = $('#feedback-chart').getContext('2d');
+    if (!feedback || feedback.length === 0) {
+         ctx.canvas.parentElement.innerHTML = '<p style="text-align: center;">No feedback data yet.</p>'; return;
+    }
+
+    // --- FIX: Define colors directly for chart reliability ---
+    const successColor = '#10b981'; // Green for 'Up Votes'
+    const dangerColor = '#ef4444';   // Red for 'Down Votes'
+
+    const counts = feedback.reduce((acc, f) => { acc[f.feedback] = (acc[f.feedback] || 0) + 1; return acc; }, { up: 0, down: 0 });
+    state.charts.feedback = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+            labels: ['Up Votes', 'Down Votes'],
+            datasets: [{
+                data: [counts.up, counts.down],
+                backgroundColor: [successColor, dangerColor],
+                borderColor: 'var(--bg-surface)',
+                borderWidth: 4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            cutout: '70%',
+            plugins: {
+                legend: {
+                    position: 'bottom', // Adds a helpful legend below the chart
+                }
+            }
+        }
+    });
+}
+
+    // --- TABS ---
+    function handleTabSwitch(e) {
+        const clickedTab = e.target.closest('.tab-btn');
+        if(!clickedTab) return;
+        
+        const parent = clickedTab.closest('.page-content');
+        parent.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        clickedTab.classList.add('active');
+        
+        parent.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        parent.querySelector(`#${clickedTab.dataset.tab}-tab-content`).classList.add('active');
+    }
+
+    init();
+});
