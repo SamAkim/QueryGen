@@ -12,7 +12,7 @@ JIRA_SERVER = 'https://chaoticbunch69.atlassian.net'
 JIRA_EMAIL = 'chaoticbunch69@gmail.com' # <--- PUT YOUR EMAIL HERE
 
 # 3. The API Token you created and saved
-JIRA_API_TOKEN = 'ATATT3xFfGF0d4AXYKVXBuSbCD3PMWWUqcbbNba09ESCu0GD0D6SQ9Dfk6Z3T1m3qkzsS6aRoq6g3LGmAvmg2NvZL_cxuV9seb7X-PeuKWtumeSdQ6fZCV2ARyjJPaoE_dPcyztd9qZRIUZKlQL28XGsqPrF3RNUAPe__BjCrMT3CPTuE6Agbrs=EB440A98' # <--- PUT YOUR API TOKEN HERE
+JIRA_API_TOKEN = '' # <--- PUT YOUR API TOKEN HERE
 
 # --- End of Configuration ---
 
@@ -59,4 +59,5 @@ else:
                     f.write(attachment.get())
                 print(f"    - ✅ Downloaded to '{download_path}'")
         else:
+
             print("  - No attachments found for this issue.")
