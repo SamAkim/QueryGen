@@ -61,3 +61,4 @@ else:
         else:
 
             print("  - No attachments found for this issue.")
+
