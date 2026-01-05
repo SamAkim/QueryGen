@@ -1,0 +1,396 @@
+"""
+Real MCP Server for Jira Integration
+Proper MCP implementation using Server class
+"""
+
+import json
+import base64
+import logging
+import sys
+from typing import Any, List
+from jira import JIRA
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent, ListToolsResult
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+logger = logging.getLogger(__name__)
+
+print("MCP Jira server module loaded - PROPER MCP", file=sys.stderr)
+
+# Store active Jira connections
+JIRA_CONNECTIONS: dict[str, JIRA] = {}
+
+# Create proper MCP server instance
+server = Server("jira-server")
+
+@server.list_tools()
+async def handle_list_tools() -> ListToolsResult:
+    """List available Jira tools"""
+    logger.info("Listing tools")
+    tools = [
+        Tool(
+            name="connect_jira",
+            description="Connect to a Jira instance",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "jira_url": {"type": "string"},
+                    "username": {"type": "string"},
+                    "api_token": {"type": "string"},
+                },
+                "required": ["jira_url", "username", "api_token"]
+            }
+        ),
+        Tool(
+            name="get_projects",
+            description="Get all projects from connected Jira instance",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "connection_id": {"type": "string"},
+                },
+                "required": ["connection_id"]
+            }
+        ),
+        Tool(
+            name="get_issues",
+            description="Get issues",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "connection_id": {"type": "string"},
+                    "project_key": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 100}
+                },
+                "required": ["connection_id", "project_key"]
+            }
+        ),
+        Tool(
+            name="get_issue",
+            description="Get detailed information about a specific issue",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "connection_id": {"type": "string"},
+                    "issue_key": {"type": "string"},
+                },
+                "required": ["connection_id", "issue_key"]
+            }
+        ),
+        Tool(
+            name="download_attachment",
+            description="Download an attachment from Jira",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "connection_id": {"type": "string"},
+                    "attachment_url": {"type": "string"},
+                    "filename": {"type": "string"},
+                },
+                "required": ["connection_id", "attachment_url", "filename"]
+            }
+        ),
+        Tool(
+            name="disconnect",
+            description="Disconnect from Jira",
+            inputSchema={
+                "type": "object",
+                "properties": {"connection_id": {"type": "string"}},
+                "required": ["connection_id"]
+            }
+        )
+    ]
+    return ListToolsResult(tools=tools)
+
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> List[TextContent]:
+    """Handle tool calls"""
+    logger.info(f"Calling tool: {name} with {arguments}")
+    
+    try:
+        if name == "connect_jira":
+            return await tool_connect_jira(arguments)
+        elif name == "get_projects":
+            return await tool_get_projects(arguments)
+        elif name == "get_issues":
+            return await tool_get_issues(arguments)
+        elif name == "get_issue":
+            return await tool_get_issue(arguments)
+        elif name == "download_attachment":
+            return await tool_download_attachment(arguments)
+        elif name == "disconnect":
+            return await tool_disconnect(arguments)
+        else:
+            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            
+    except Exception as e:
+        logger.exception(f"Tool handler error for {name}")
+        return [TextContent(type="text", text=f"Error: {str(e)}")]
+
+async def tool_connect_jira(args: dict) -> List[TextContent]:
+    """Connect to Jira"""
+    try:
+        logger.info(f"Connecting to Jira: {args.get('jira_url')}")
+        print(f"DEBUG: Connecting to {args['jira_url']} as {args['username']}", file=sys.stderr)
+        
+        jira_client = JIRA(
+            server=args["jira_url"],
+            basic_auth=(args["username"], args["api_token"]),
+            options={"verify": False},
+        )
+        
+        # Test connection
+        user_info = jira_client.myself()
+        connection_id = f"jira_{len(JIRA_CONNECTIONS)}"
+        JIRA_CONNECTIONS[connection_id] = jira_client
+        
+        logger.info(f"Connected to Jira with ID: {connection_id}")
+        print(f"DEBUG: Successfully connected to Jira as {user_info.get('displayName')}", file=sys.stderr)
+        
+        return [TextContent(type="text", text=json.dumps({
+            "status": "connected",
+            "connection_id": connection_id,
+            "message": f"Successfully connected to {args['jira_url']} as {user_info.get('displayName')}"
+        }))]
+        
+    except Exception as e:
+        logger.exception("Connection failed")
+        return [TextContent(type="text", text=f"Connection failed: {str(e)}")]
+
+async def tool_get_projects(args: dict) -> List[TextContent]:
+    """Get Jira projects"""
+    try:
+        connection_id = args["connection_id"]
+        jira_client = JIRA_CONNECTIONS.get(connection_id)
+        if not jira_client:
+            return [TextContent(type="text", text="Invalid connection ID")]
+            
+        logger.info(f"Fetching projects for {connection_id}")
+        projects = [{"id": p.id, "key": p.key, "name": p.name, "description": getattr(p, "description", "")}
+                   for p in jira_client.projects()]
+        logger.info(f"Retrieved {len(projects)} projects")
+        
+        return [TextContent(type="text", text=json.dumps({
+            "projects": projects, 
+            "count": len(projects)
+        }))]
+        
+    except Exception as e:
+        logger.exception("Failed to get projects")
+        return [TextContent(type="text", text=f"Error getting projects: {str(e)}")]
+
+async def tool_get_issues(args: dict) -> List[TextContent]:
+    """Get Jira issues"""
+    try:
+        connection_id = args["connection_id"]
+        project_key = args["project_key"]
+        max_results = args.get("max_results", 100)
+        
+        jira_client = JIRA_CONNECTIONS.get(connection_id)
+        if not jira_client:
+            return [TextContent(type="text", text="Invalid connection ID")]
+            
+        logger.info(f"Fetching issues for project {project_key}")
+        issues_data = jira_client.search_issues(
+            f"project={project_key}", 
+            maxResults=max_results, 
+            expand="attachment,renderedFields"
+        )
+        
+        issues = []
+        for issue in issues_data:
+            attachments = []
+            for attachment in getattr(issue.fields, "attachment", []):
+                attachments.append({
+                    "filename": attachment.filename,
+                    "url": attachment.content,
+                    "size": getattr(attachment, "size", 0),
+                    "mimeType": getattr(attachment, "mimeType", "")
+                })
+            issues.append({
+                "key": issue.key,
+                "summary": getattr(issue.fields, "summary", ""),
+                "description": getattr(issue.fields, "description", ""),
+                "issue_type": getattr(issue.fields.issuetype, "name", ""),
+                "status": getattr(issue.fields.status, "name", ""),
+                "assignee": getattr(getattr(issue.fields, "assignee", None), "displayName", "Unassigned") if getattr(issue.fields, "assignee", None) else "Unassigned",
+                "priority": getattr(getattr(issue.fields, "priority", None), "name", "") if getattr(issue.fields, "priority", None) else "",
+                "created": str(getattr(issue.fields, "created", "")),
+                "updated": str(getattr(issue.fields, "updated", "")),
+                "attachments": attachments
+            })
+            
+        logger.info(f"Retrieved {len(issues)} issues")
+        return [TextContent(type="text", text=json.dumps({
+            "issues": issues, 
+            "count": len(issues)
+        }))]
+        
+    except Exception as e:
+        logger.exception("Failed to get issues")
+        return [TextContent(type="text", text=f"Error getting issues: {str(e)}")]
+
+async def tool_get_issue(args: dict) -> List[TextContent]:
+    """Get specific Jira issue"""
+    try:
+        connection_id = args["connection_id"]
+        issue_key = args["issue_key"]
+        
+        jira_client = JIRA_CONNECTIONS.get(connection_id)
+        if not jira_client:
+            return [TextContent(type="text", text="Invalid connection ID")]
+            
+        logger.info(f"Fetching issue {issue_key}")
+        issue = jira_client.issue(issue_key, expand="attachment,renderedFields")
+        
+        attachments = []
+        for attachment in getattr(issue.fields, "attachment", []):
+            attachments.append({
+                "filename": attachment.filename,
+                "url": attachment.content,
+                "size": getattr(attachment, "size", 0),
+                "mimeType": getattr(attachment, "mimeType", "")
+            })
+            
+        issue_data = {
+            "key": issue.key,
+            "summary": getattr(issue.fields, "summary", ""),
+            "description": getattr(issue.fields, "description", ""),
+            "issue_type": getattr(issue.fields.issuetype, "name", ""),
+            "status": getattr(issue.fields.status, "name", ""),
+            "assignee": getattr(getattr(issue.fields, "assignee", None), "displayName", "Unassigned") if getattr(issue.fields, "assignee", None) else "Unassigned",
+            "priority": getattr(getattr(issue.fields, "priority", None), "name", "") if getattr(issue.fields, "priority", None) else "",
+            "created": str(getattr(issue.fields, "created", "")),
+            "updated": str(getattr(issue.fields, "updated", "")),
+            "attachments": attachments
+        }
+        
+        logger.info(f"Retrieved issue {issue_key}")
+        return [TextContent(type="text", text=json.dumps({"issue": issue_data}))]
+        
+    except Exception as e:
+        logger.exception("Failed to get issue")
+        return [TextContent(type="text", text=f"Error getting issue: {str(e)}")]
+
+async def tool_download_attachment(args: dict) -> List[TextContent]:
+    """Download Jira attachment - handle security blocks gracefully"""
+    try:
+        connection_id = args["connection_id"]
+        attachment_url = args["attachment_url"]
+        filename = args["filename"]
+        
+        jira_client = JIRA_CONNECTIONS.get(connection_id)
+        if not jira_client:
+            return [TextContent(type="text", text="Invalid connection ID")]
+            
+        logger.info(f"Downloading attachment: {filename}")
+        
+        try:
+            response = jira_client._session.get(attachment_url, stream=True, verify=False)
+            
+            if response.status_code != 200:
+                # Don't print the full HTML content - just log the error
+                logger.warning(f"Attachment download failed: HTTP {response.status_code} for {filename}")
+                
+                # Check if it's a security block (Zscaler, etc.)
+                if response.status_code in [403, 451]:
+                    return [TextContent(type="text", text=json.dumps({
+                        "filename": filename,
+                        "status": "blocked",
+                        "error": f"Security block: Access denied by perimeter security (HTTP {response.status_code})",
+                        "size": 0
+                    }))]
+                else:
+                    return [TextContent(type="text", text=json.dumps({
+                        "filename": filename,
+                        "status": "failed",
+                        "error": f"Download failed: HTTP {response.status_code}",
+                        "size": 0
+                    }))]
+            
+            # Check if response is HTML (indicating a block page)
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' in content_type:
+                logger.warning(f"Attachment blocked: Received HTML instead of file for {filename}")
+                return [TextContent(type="text", text=json.dumps({
+                    "filename": filename,
+                    "status": "blocked", 
+                    "error": "Security block: Received HTML content (likely blocked by corporate security)",
+                    "size": 0
+                }))]
+            
+            file_content = response.content
+            file_content_b64 = base64.b64encode(file_content).decode("utf-8")
+            
+            logger.info(f"Downloaded {filename} ({len(file_content)} bytes)")
+            return [TextContent(type="text", text=json.dumps({
+                "filename": filename,
+                "file_content": file_content_b64,
+                "size": len(file_content),
+                "status": "success"
+            }))]
+            
+        except Exception:
+            logger.warning(f"Download error for {filename}")
+            return [TextContent(type="text", text=json.dumps({
+                "filename": filename,
+                "status": "error",
+                "error": f"Download error",
+                "size": 0
+            }))]
+        
+    except Exception:
+        logger.exception("Error in download_attachment")
+        return [TextContent(type="text", text=json.dumps({
+            "filename": args.get("filename", "unknown"),
+            "status": "error",
+            "error": f"Attachment processing error",
+            "size": 0
+        }))]
+
+async def tool_disconnect(args: dict) -> List[TextContent]:
+    """Disconnect from Jira"""
+    try:
+        connection_id = args["connection_id"]
+        if connection_id in JIRA_CONNECTIONS:
+            jira_client = JIRA_CONNECTIONS[connection_id]
+            if hasattr(jira_client, "_session"):
+                jira_client._session.close()
+            del JIRA_CONNECTIONS[connection_id]
+            logger.info(f"Disconnected {connection_id}")
+            return [TextContent(type="text", text=json.dumps({
+                "status": "disconnected", 
+                "connection_id": connection_id
+            }))]
+        else:
+            return [TextContent(type="text", text="Connection not found")]
+            
+    except Exception as e:
+        logger.exception("Error disconnecting")
+        return [TextContent(type="text", text=f"Error disconnecting: {str(e)}")]
+
+async def main():
+    """Main MCP server entry point"""
+    print("MCP Jira server starting...", file=sys.stderr)
+    logger.info("Starting MCP Jira server")
+    
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options()
+        )
+
+if __name__ == "__main__":
+    try:
+        import anyio
+        anyio.run(main)
+    except Exception as e:
+        logger.exception(f"Server crashed: {e}")
+        print(f"DEBUG: Server crashed: {e}", file=sys.stderr)
+        sys.exit(1)
